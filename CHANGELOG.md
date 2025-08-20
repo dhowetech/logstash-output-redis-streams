@@ -1,0 +1,12 @@
+## 1.0.0
+  - Initial release of logstash-output-redis-streams plugin
+  - Support for Redis Streams using XADD command
+  - Stream partitioning with multiple strategies:
+    - Random partitioning
+    - Hash-based partitioning
+    - Time-based partitioning
+  - Batch processing with Redis pipelining for optimal performance
+  - Stream length management with MAXLEN
+  - SSL/TLS support
+  - Connection management with automatic reconnection
+  - Multiple host support with failover

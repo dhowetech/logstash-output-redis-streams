@@ -1,0 +1,67 @@
+setup.md
+# Ruby/Gem files
+*.gem
+.bundle/
+vendor/bundle/
+.rvm-gemset
+
+# Ruby version managers
+.ruby-version
+.ruby-gemset
+.rvmrc
+
+# Bundler
+Gemfile.lock
+
+# RSpec
+.rspec_status
+
+# Coverage reports
+coverage/
+.simplecov
+
+# Test artifacts
+test/tmp/
+test/version_tmp/
+tmp/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logstash specific
+logstash-*.tar.gz
+logstash-*.zip
+
+# Build artifacts
+pkg/
+*.gem
+
+# Log files
+*.log
+logs/
+
+# Documentation generated files
+doc/
+.yardoc/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+*.tmp
+*.temp
