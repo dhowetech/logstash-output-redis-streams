@@ -302,7 +302,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     case @partition_strategy
     when "random"
       partition_num = rand(@partition_count)
-      "#{base_stream_name}-#{partition_num}"
+      "#{base_stream_name}:#{partition_num}"
     when "hash"
       field_value = event.get(@partition_field)
       if field_value.nil?
@@ -311,10 +311,10 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
       else
         partition_num = field_value.hash.abs % @partition_count
       end
-      "#{base_stream_name}-#{partition_num}"
+      "#{base_stream_name}:#{partition_num}"
     when "time_based"
       time_suffix = Time.now.strftime(@time_format)
-      "#{base_stream_name}-#{time_suffix}"
+      "#{base_stream_name}:#{time_suffix}"
     else
       base_stream_name
     end
