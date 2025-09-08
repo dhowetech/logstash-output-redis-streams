@@ -2,6 +2,7 @@
 require "logstash/outputs/base"
 require "logstash/namespace"
 require "stud/buffer"
+require "redis"
 
 # This output will send events to Redis Streams using XADD.
 # Redis Streams were introduced in Redis 5.0 and provide a powerful
@@ -120,8 +121,6 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   config :approximate_trimming, :validate => :boolean, :default => true
 
   def register
-    require 'redis'
-
     validate_ssl_config!
     validate_partitioning_config!
 
@@ -145,8 +144,6 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   def receive(event)
     begin
       @codec.encode(event)
-    rescue LocalJumpError
-      raise
     rescue StandardError => e
       @logger.warn("Error encoding event", :exception => e,
                    :event => event)
@@ -360,7 +357,8 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
 
   # A string used to identify a Redis instance in log messages
   def identity
-    "redis://#{@password}@#{@current_host}:#{@current_port}/#{@db} stream:#{@stream}"
+    password_part = @password ? "****@" : ""
+    "redis://#{password_part}#{@current_host}:#{@current_port}/#{@db} stream:#{@stream}"
   end
 
   def send_to_redis_stream(event, payload)
