@@ -111,6 +111,19 @@ output {
 }
 ```
 
+### Stream Size and Retention Management
+```ruby
+output {
+  redis_streams {
+    host => ["127.0.0.1"]
+    stream => "logstash-events"
+    max_stream_size => 50000        # Keep only the latest 50k messages
+    stream_retention => 86400       # Keep messages for 24 hours (86400 seconds)
+    approximate_trimming => true
+  }
+}
+```
+
 ## Configuration Options
 
 | Setting | Input type | Required | Default | Description |
@@ -129,6 +142,8 @@ output {
 | `batch_events` | number | No | `50` | Number of events per batch |
 | `batch_timeout` | number | No | `5` | Maximum time between batches (seconds) |
 | `maxlen` | number | No | `0` | Maximum stream length (0 = unlimited) |
+| `max_stream_size` | number | No | `0` | Alternative to maxlen - maximum number of messages in stream (0 = unlimited) |
+| `stream_retention` | number | No | `0` | Time-based retention in seconds - removes messages older than this (0 = unlimited) |
 | `approximate_trimming` | boolean | No | `true` | Use approximate trimming for better performance |
 | `ssl_enabled` | boolean | No | `false` | Enable SSL/TLS |
 

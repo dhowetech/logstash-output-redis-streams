@@ -120,9 +120,20 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   # This allows the stream to be slightly longer than maxlen for better performance.
   config :approximate_trimming, :validate => :boolean, :default => true
 
+  # Maximum number of messages to keep in each stream. Alternative to maxlen.
+  # When set, older messages beyond this count will be automatically trimmed.
+  # Set to 0 to disable message count-based trimming.
+  config :max_stream_size, :validate => :number, :default => 0
+
+  # Stream retention time in seconds. Messages older than this will be automatically removed.
+  # Uses MINID trimming based on Redis Stream ID timestamps (epoch milliseconds).
+  # Set to 0 to disable time-based retention.
+  config :stream_retention, :validate => :number, :default => 0
+
   def register
     validate_ssl_config!
     validate_partitioning_config!
+    validate_stream_config!
 
     if @batch
       buffer_initialize(
@@ -289,6 +300,47 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
   end
 
+  def validate_stream_config!
+    # Check for conflicting stream management configurations
+    active_options = []
+    active_options << "maxlen" if @maxlen > 0
+    active_options << "max_stream_size" if @max_stream_size > 0
+    active_options << "stream_retention" if @stream_retention > 0
+    
+    if active_options.length > 1
+      raise LogStash::ConfigurationError, "Cannot specify multiple stream management options: #{active_options.join(', ')} - use only one"
+    end
+
+    # Validate retention settings
+    if @stream_retention < 0
+      raise LogStash::ConfigurationError, "stream_retention must be 0 or greater"
+    end
+  end
+
+  def get_trim_options
+    options = {}
+
+    # Handle message count-based trimming (MAXLEN)
+    maxlen_value = @maxlen > 0 ? @maxlen : @max_stream_size
+    if maxlen_value > 0
+      options[:maxlen] = maxlen_value
+      options[:approximate] = @approximate_trimming
+    end
+
+    # Handle time-based retention (MINID)
+    if @stream_retention > 0
+      # Calculate the minimum ID threshold based on retention time
+      # Redis Stream IDs are epoch milliseconds by default
+      retention_ms = @stream_retention * 1000
+      current_time_ms = (Time.now.to_i * 1000)
+      min_id_threshold = current_time_ms - retention_ms
+      options[:minid] = "#{min_id_threshold}"
+      # Note: When both MAXLEN and MINID are specified, Redis applies both
+    end
+
+    options
+  end
+
   def get_stream_name(event)
     base_stream_name = event.sprintf(@stream)
     
@@ -325,14 +377,11 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
 
     # Build the xadd arguments properly for the Redis gem
-    if @maxlen > 0
-      if @approximate_trimming
-        @redis.xadd(stream_name, redis_fields, maxlen: @maxlen, approximate: true)
-      else
-        @redis.xadd(stream_name, redis_fields, maxlen: @maxlen)
-      end
-    else
+    trim_options = get_trim_options
+    if trim_options.empty?
       @redis.xadd(stream_name, redis_fields)
+    else
+      @redis.xadd(stream_name, redis_fields, **trim_options)
     end
   end
 
@@ -344,14 +393,11 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
 
     # Build the xadd arguments properly for the Redis gem in pipelined mode
-    if @maxlen > 0
-      if @approximate_trimming
-        pipeline.xadd(stream_name, redis_fields, maxlen: @maxlen, approximate: true)
-      else
-        pipeline.xadd(stream_name, redis_fields, maxlen: @maxlen)
-      end
-    else
+    trim_options = get_trim_options
+    if trim_options.empty?
       pipeline.xadd(stream_name, redis_fields)
+    else
+      pipeline.xadd(stream_name, redis_fields, **trim_options)
     end
   end
 
