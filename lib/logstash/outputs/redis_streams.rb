@@ -373,7 +373,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     # Convert event data to string values as required by Redis XADD
     redis_fields = {}
     event_data.each do |key, value|
-      redis_fields[key.to_s] = value.to_s
+      redis_fields[key.to_s] = serialize_value(value)
     end
 
     # Build the xadd arguments properly for the Redis gem
@@ -385,11 +385,22 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
   end
 
+  def serialize_value(value)
+    # Convert complex objects to JSON strings, simple values to strings
+    case value
+    when String, Numeric, TrueClass, FalseClass, NilClass
+      value.to_s
+    else
+      # Use JSON serialization for complex objects (arrays, hashes, etc.)
+      LogStash::Json.dump(value)
+    end
+  end
+
   def xadd_stream_pipelined(pipeline, stream_name, event_data)
     # Convert event data to string values as required by Redis XADD
     redis_fields = {}
     event_data.each do |key, value|
-      redis_fields[key.to_s] = value.to_s
+      redis_fields[key.to_s] = serialize_value(value)
     end
 
     # Build the xadd arguments properly for the Redis gem in pipelined mode
