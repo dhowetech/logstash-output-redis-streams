@@ -3,6 +3,7 @@ require "logstash/outputs/base"
 require "logstash/namespace"
 require "stud/buffer"
 require "redis"
+require "zlib"
 
 # This output will send events to Redis Streams using XADD.
 # Redis Streams were introduced in Redis 5.0 and provide a powerful
@@ -67,8 +68,14 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   # The Redis database number.
   config :db, :validate => :number, :default => 0
 
-  # Redis initial connection timeout in seconds.
-  config :timeout, :validate => :number, :default => 5
+  # Redis connection timeout in seconds.
+  config :connect_timeout, :validate => :number, :default => 5
+
+  # Redis read timeout in seconds.
+  config :read_timeout, :validate => :number, :default => 5
+
+  # Redis write timeout in seconds.
+  config :write_timeout, :validate => :number, :default => 5
 
   # Password to authenticate with.  There is no authentication by default.
   config :password, :validate => :password
@@ -171,11 +178,11 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
         # Parse the JSON payload to get individual fields for XADD
         begin
           event_data = LogStash::Json.load(event_payload)
-          xadd_stream_pipelined(pipeline, stream_name, event_data)
+          xadd_stream_pipelined(pipeline, stream_name, event_data, nil)
         rescue => e
           @logger.warn("Failed to parse event for XADD", :payload => event_payload, :exception => e)
           # Fall back to storing the raw payload as a single field
-          xadd_stream_pipelined(pipeline, stream_name, {"message" => event_payload})
+          xadd_stream_pipelined(pipeline, stream_name, {"message" => event_payload}, nil)
         end
       end
     end
@@ -214,7 +221,9 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     params = {
       :host => @current_host,
       :port => @current_port,
-      :timeout => @timeout,
+      :connect_timeout => @connect_timeout,
+      :read_timeout => @read_timeout,
+      :write_timeout => @write_timeout,
       :db => @db,
       :ssl => @ssl_enabled,
     }
@@ -239,7 +248,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     if @ssl_verification_mode == 'none'
       params[:verify_mode] = OpenSSL::SSL::VERIFY_NONE
     else
-      params[:verify_mode] = OpenSSL::SSL::VERIFY_PEER|OpenSSL::SSL::VERIFY_FAIL_IF_NO_PEER_CERT
+      params[:verify_mode] = OpenSSL::SSL::VERIFY_PEER
     end
 
     if @ssl_certificate
@@ -317,7 +326,8 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
   end
 
-  def get_trim_options
+
+  def get_trim_options(event = nil)
     options = {}
 
     # Handle message count-based trimming (MAXLEN)
@@ -332,7 +342,9 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
       # Calculate the minimum ID threshold based on retention time
       # Redis Stream IDs are epoch milliseconds by default
       retention_ms = @stream_retention * 1000
-      current_time_ms = (Time.now.to_i * 1000)
+      # Use event timestamp when available, fallback to current time
+      event_time = event && event.timestamp ? event.timestamp.time : Time.now
+      current_time_ms = (event_time.to_i * 1000)
       min_id_threshold = current_time_ms - retention_ms
       options[:minid] = "#{min_id_threshold}"
       # Note: When both MAXLEN and MINID are specified, Redis applies both
@@ -358,18 +370,19 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
         @logger.warn("Partition field '#{@partition_field}' not found in event, using partition 0")
         partition_num = 0
       else
-        partition_num = field_value.hash.abs % @partition_count
+        partition_num = Zlib.crc32(field_value.to_s).abs % @partition_count
       end
       "#{base_stream_name}:#{partition_num}"
     when "time_based"
-      time_suffix = Time.now.strftime(@time_format)
+      event_time = event.timestamp ? event.timestamp.time : Time.now
+      time_suffix = event_time.strftime(@time_format)
       "#{base_stream_name}:#{time_suffix}"
     else
       base_stream_name
     end
   end
 
-  def xadd_stream(stream_name, event_data)
+  def xadd_stream(stream_name, event_data, event = nil)
     # Convert event data to string values as required by Redis XADD
     redis_fields = {}
     event_data.each do |key, value|
@@ -377,7 +390,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
 
     # Build the xadd arguments properly for the Redis gem
-    trim_options = get_trim_options
+    trim_options = get_trim_options(event)
     if trim_options.empty?
       @redis.xadd(stream_name, redis_fields)
     else
@@ -396,7 +409,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
   end
 
-  def xadd_stream_pipelined(pipeline, stream_name, event_data)
+  def xadd_stream_pipelined(pipeline, stream_name, event_data, event = nil)
     # Convert event data to string values as required by Redis XADD
     redis_fields = {}
     event_data.each do |key, value|
@@ -404,7 +417,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
 
     # Build the xadd arguments properly for the Redis gem in pipelined mode
-    trim_options = get_trim_options
+    trim_options = get_trim_options(event)
     if trim_options.empty?
       pipeline.xadd(stream_name, redis_fields)
     else
@@ -433,11 +446,11 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
       # Parse the JSON payload to get individual fields for XADD
       begin
         event_data = LogStash::Json.load(payload)
-        xadd_stream(stream_name, event_data)
+        xadd_stream(stream_name, event_data, event)
       rescue => parse_error
         @logger.warn("Failed to parse event for XADD", :payload => payload, :exception => parse_error)
         # Fall back to storing the raw payload as a single field
-        xadd_stream(stream_name, {"message" => payload})
+        xadd_stream(stream_name, {"message" => payload}, event)
       end
     rescue => e
       @logger.warn("Failed to send event to Redis Stream", :event => event,
