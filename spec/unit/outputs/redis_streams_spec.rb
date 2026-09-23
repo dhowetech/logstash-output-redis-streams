@@ -128,6 +128,11 @@ describe LogStash::Outputs::RedisStreams do
       expect { described_class.new(config) }.to raise_error(LogStash::ConfigurationError)
     end
 
+    it "should reject an empty payload field" do
+      redis_streams = described_class.new("stream" => "test_stream", "field" => " ")
+      expect { redis_streams.register }.to raise_error(LogStash::ConfigurationError, /field must not be empty/)
+    end
+
     it "should validate partition_count when partitioning is enabled" do
       config = {
         "stream" => "test_stream",
@@ -252,26 +257,16 @@ describe LogStash::Outputs::RedisStreams do
       allow(redis_streams).to receive(:connect).and_return(mock_redis)
     end
 
-    it "should convert event data to string key-value pairs for XADD" do
+    it "should write the complete payload to the body field for XADD" do
       redis_streams.register
-      
-      event_data = {
-        "timestamp" => "2024-01-15T10:30:00Z",
-        "level" => "INFO",
-        "message" => "Test log message",
-        "user_id" => 12345
-      }
+      payload = '{"type":"log4_metric","metric":{"name":"api.time","value":123.45}}'
 
       expect(mock_redis).to receive(:xadd).with(
-        "test_stream", 
-        "*", 
-        "timestamp", "2024-01-15T10:30:00Z",
-        "level", "INFO",
-        "message", "Test log message",
-        "user_id", "12345"
+        "test_stream",
+        {"body" => payload}
       )
 
-      redis_streams.send(:xadd_stream, "test_stream", event_data)
+      redis_streams.send(:xadd_stream, "test_stream", payload)
     end
 
     it "should add MAXLEN trimming when configured" do
@@ -280,16 +275,16 @@ describe LogStash::Outputs::RedisStreams do
       allow(redis_streams_with_maxlen).to receive(:connect).and_return(mock_redis)
       redis_streams_with_maxlen.register
       
-      event_data = {"message" => "test"}
+      payload = '{"message":"test"}'
 
       expect(mock_redis).to receive(:xadd).with(
-        "test_stream", 
-        "MAXLEN", "~", 1000,
-        "*", 
-        "message", "test"
+        "test_stream",
+        {"body" => payload},
+        :maxlen => 1000,
+        :approximate => true
       )
 
-      redis_streams_with_maxlen.send(:xadd_stream, "test_stream", event_data)
+      redis_streams_with_maxlen.send(:xadd_stream, "test_stream", payload)
     end
   end
 end

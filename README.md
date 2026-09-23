@@ -44,6 +44,41 @@ output {
 }
 ```
 
+### Redis-to-OTel Bridge Configuration
+
+The bridge expects the complete JSON event in one stream field named `body`. Use
+one output per bridge stream:
+
+```ruby
+output {
+  if [sampled_for_bridge] and ([type] == "log4net_log" or [type] == "log4_log") {
+    redis_streams {
+      host => ["localhost"]
+      port => 6379
+      db => 0
+      stream => "log4_logs"
+      field => "body"
+      codec => json
+    }
+  }
+
+  if [sampled_for_bridge] and ([type] == "log4net_metric" or [type] == "log4_metric") {
+    redis_streams {
+      host => ["localhost"]
+      port => 6379
+      db => 0
+      stream => "log4_metrics"
+      field => "body"
+      codec => json
+    }
+  }
+}
+```
+
+Each event is written as `XADD <stream> * body '<JSON event>'`. Do not enable
+partitioning for these outputs unless the bridge is configured with matching
+partitioned stream names.
+
 ### Partitioned Streams
 
 #### Random Partitioning
@@ -129,6 +164,7 @@ output {
 | Setting | Input type | Required | Default | Description |
 |---------|------------|----------|---------|-------------|
 | `stream` | string | Yes | | The name of the Redis stream. Supports dynamic names like `logstash-%{type}` |
+| `field` | string | No | `body` | The field containing the complete codec-serialized event payload |
 | `host` | array | No | `["127.0.0.1"]` | Redis server hostnames |
 | `port` | number | No | `6379` | Redis server port |
 | `password` | password | No | | Redis authentication password |

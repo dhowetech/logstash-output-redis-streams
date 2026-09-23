@@ -82,6 +82,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
 
   # The name of a Redis stream. Dynamic names are valid here, for example `logstash-%{type}`.
   config :stream, :validate => :string, :required => true
+  config :field, :validate => :string, :default => "body"
 
   # Enable stream partitioning to distribute events across multiple streams.
   # When enabled, multiple streams will be created based on the partitioning strategy.
@@ -175,15 +176,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     # Use Redis pipelining to send all XADD commands in a single network round-trip
     @redis.pipelined do |pipeline|
       events.each do |event_payload|
-        # Parse the JSON payload to get individual fields for XADD
-        begin
-          event_data = LogStash::Json.load(event_payload)
-          xadd_stream_pipelined(pipeline, stream_name, event_data, nil)
-        rescue => e
-          @logger.warn("Failed to parse event for XADD", :payload => event_payload, :exception => e)
-          # Fall back to storing the raw payload as a single field
-          xadd_stream_pipelined(pipeline, stream_name, {"message" => event_payload}, nil)
-        end
+        xadd_stream_pipelined(pipeline, stream_name, event_payload, nil)
       end
     end
   end
@@ -310,6 +303,10 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   end
 
   def validate_stream_config!
+    if @field.nil? || @field.strip.empty?
+      raise LogStash::ConfigurationError, "field must not be empty"
+    end
+
     # Check for conflicting stream management configurations
     active_options = []
     active_options << "maxlen" if @maxlen > 0
@@ -382,46 +379,23 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
   end
 
-  def xadd_stream(stream_name, event_data, event = nil)
-    # Convert event data to string values as required by Redis XADD
-    redis_fields = {}
-    event_data.each do |key, value|
-      redis_fields[key.to_s] = serialize_value(value)
-    end
-
+  def xadd_stream(stream_name, payload, event = nil)
     # Build the xadd arguments properly for the Redis gem
     trim_options = get_trim_options(event)
     if trim_options.empty?
-      @redis.xadd(stream_name, redis_fields)
+      @redis.xadd(stream_name, @field => payload)
     else
-      @redis.xadd(stream_name, redis_fields, **trim_options)
+      @redis.xadd(stream_name, @field => payload, **trim_options)
     end
   end
 
-  def serialize_value(value)
-    # Convert complex objects to JSON strings, simple values to strings
-    case value
-    when String, Numeric, TrueClass, FalseClass, NilClass
-      value.to_s
-    else
-      # Use JSON serialization for complex objects (arrays, hashes, etc.)
-      LogStash::Json.dump(value)
-    end
-  end
-
-  def xadd_stream_pipelined(pipeline, stream_name, event_data, event = nil)
-    # Convert event data to string values as required by Redis XADD
-    redis_fields = {}
-    event_data.each do |key, value|
-      redis_fields[key.to_s] = serialize_value(value)
-    end
-
+  def xadd_stream_pipelined(pipeline, stream_name, payload, event = nil)
     # Build the xadd arguments properly for the Redis gem in pipelined mode
     trim_options = get_trim_options(event)
     if trim_options.empty?
-      pipeline.xadd(stream_name, redis_fields)
+      pipeline.xadd(stream_name, @field => payload)
     else
-      pipeline.xadd(stream_name, redis_fields, **trim_options)
+      pipeline.xadd(stream_name, @field => payload, **trim_options)
     end
   end
 
@@ -443,15 +417,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     begin
       @redis ||= connect
       
-      # Parse the JSON payload to get individual fields for XADD
-      begin
-        event_data = LogStash::Json.load(payload)
-        xadd_stream(stream_name, event_data, event)
-      rescue => parse_error
-        @logger.warn("Failed to parse event for XADD", :payload => payload, :exception => parse_error)
-        # Fall back to storing the raw payload as a single field
-        xadd_stream(stream_name, {"message" => payload}, event)
-      end
+      xadd_stream(stream_name, payload, event)
     rescue => e
       @logger.warn("Failed to send event to Redis Stream", :event => event,
                    :identity => identity, :exception => e,
