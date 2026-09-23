@@ -180,9 +180,10 @@ describe LogStash::Outputs::RedisStreams do
       redis_streams.register
       mock_redis = double("redis")
       allow(redis_streams).to receive(:connect).and_return(mock_redis)
-      
+      allow(mock_redis).to receive(:respond_to?).with(:xadd).and_return(true)
+
       # Mock pipelining - the key test is that pipelined is called
-      expect(mock_redis).to receive(:pipelined).and_yield
+      expect(mock_redis).to receive(:pipelined).and_yield(mock_redis)
       expect(mock_redis).to receive(:xadd).exactly(3).times
       
       # Simulate a flush with 3 events
@@ -257,34 +258,72 @@ describe LogStash::Outputs::RedisStreams do
       allow(redis_streams).to receive(:connect).and_return(mock_redis)
     end
 
-    it "should write the complete payload to the body field for XADD" do
-      redis_streams.register
-      payload = '{"type":"log4_metric","metric":{"name":"api.time","value":123.45}}'
+    context "with a redis-rb 4.x/5.x client (native xadd)" do
+      before do
+        allow(mock_redis).to receive(:respond_to?).with(:xadd).and_return(true)
+      end
 
-      expect(mock_redis).to receive(:xadd).with(
-        "test_stream",
-        {"body" => payload}
-      )
+      it "should write the complete payload to the body field for XADD" do
+        redis_streams.register
+        payload = '{"type":"log4_metric","metric":{"name":"api.time","value":123.45}}'
 
-      redis_streams.send(:xadd_stream, "test_stream", payload)
+        expect(mock_redis).to receive(:xadd).with(
+          "test_stream",
+          {"body" => payload}
+        )
+
+        redis_streams.send(:xadd_stream, "test_stream", payload)
+      end
+
+      it "should add MAXLEN trimming when configured" do
+        config_with_maxlen = config.merge("maxlen" => 1000, "approximate_trimming" => true)
+        redis_streams_with_maxlen = described_class.new(config_with_maxlen)
+        allow(redis_streams_with_maxlen).to receive(:connect).and_return(mock_redis)
+        redis_streams_with_maxlen.register
+
+        payload = '{"message":"test"}'
+
+        expect(mock_redis).to receive(:xadd).with(
+          "test_stream",
+          {"body" => payload},
+          :maxlen => 1000,
+          :approximate => true
+        )
+
+        redis_streams_with_maxlen.send(:xadd_stream, "test_stream", payload)
+      end
     end
 
-    it "should add MAXLEN trimming when configured" do
-      config_with_maxlen = config.merge("maxlen" => 1000, "approximate_trimming" => true)
-      redis_streams_with_maxlen = described_class.new(config_with_maxlen)
-      allow(redis_streams_with_maxlen).to receive(:connect).and_return(mock_redis)
-      redis_streams_with_maxlen.register
-      
-      payload = '{"message":"test"}'
+    context "with a redis-rb 3.x client (no native xadd)" do
+      before do
+        allow(mock_redis).to receive(:respond_to?).with(:xadd).and_return(false)
+      end
 
-      expect(mock_redis).to receive(:xadd).with(
-        "test_stream",
-        {"body" => payload},
-        :maxlen => 1000,
-        :approximate => true
-      )
+      it "should issue a raw XADD command via #call" do
+        redis_streams.register
+        payload = '{"type":"log4_metric","metric":{"name":"api.time","value":123.45}}'
 
-      redis_streams_with_maxlen.send(:xadd_stream, "test_stream", payload)
+        expect(mock_redis).to receive(:call).with(
+          :xadd, "test_stream", "*", "body", payload
+        )
+
+        redis_streams.send(:xadd_stream, "test_stream", payload)
+      end
+
+      it "should include MAXLEN trimming in the raw command when configured" do
+        config_with_maxlen = config.merge("maxlen" => 1000, "approximate_trimming" => true)
+        redis_streams_with_maxlen = described_class.new(config_with_maxlen)
+        allow(redis_streams_with_maxlen).to receive(:connect).and_return(mock_redis)
+        redis_streams_with_maxlen.register
+
+        payload = '{"message":"test"}'
+
+        expect(mock_redis).to receive(:call).with(
+          :xadd, "test_stream", "MAXLEN", "~", 1000, "*", "body", payload
+        )
+
+        redis_streams_with_maxlen.send(:xadd_stream, "test_stream", payload)
+      end
     end
   end
 end

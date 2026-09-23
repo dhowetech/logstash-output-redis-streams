@@ -23,7 +23,7 @@ Gem::Specification.new do |s|
   s.add_runtime_dependency "logstash-core-plugin-api", ">= 1.60", "<= 2.99"
   s.add_runtime_dependency 'logstash-core', '>= 6.0', '< 9.0'
 
-  s.add_runtime_dependency 'redis', '~> 5.0'
+  s.add_runtime_dependency 'redis', '>= 3.3', '< 6.0'
   s.add_runtime_dependency 'stud', '~> 0.0'
 
   s.add_development_dependency 'logstash-devutils', '~> 1.0'

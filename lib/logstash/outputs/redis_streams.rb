@@ -379,23 +379,52 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
   end
 
+  # Builds a raw XADD command array compatible with the redis-rb `call`
+  # interface. Used as a fallback on redis-rb 3.x (bundled with
+  # logstash-input-redis, pinned to `redis ~> 3`), which predates the
+  # gem's native `xadd` convenience method (added in redis-rb 4.x).
+  def build_xadd_command(stream_name, payload, trim_options)
+    args = [:xadd, stream_name]
+    if trim_options[:maxlen]
+      args << "MAXLEN"
+      args << "~" if trim_options[:approximate]
+      args << trim_options[:maxlen]
+    elsif trim_options[:minid]
+      args << "MINID"
+      args << "~" if trim_options[:approximate]
+      args << trim_options[:minid]
+    end
+    args << "*"
+    args << @field
+    args << payload
+    args
+  end
+
   def xadd_stream(stream_name, payload, event = nil)
-    # Build the xadd arguments properly for the Redis gem
     trim_options = get_trim_options(event)
-    if trim_options.empty?
-      @redis.xadd(stream_name, @field => payload)
+    if @redis.respond_to?(:xadd)
+      if trim_options.empty?
+        @redis.xadd(stream_name, @field => payload)
+      else
+        @redis.xadd(stream_name, @field => payload, **trim_options)
+      end
     else
-      @redis.xadd(stream_name, @field => payload, **trim_options)
+      # redis-rb 3.x has no native `xadd`; issue the raw command instead.
+      @redis.call(*build_xadd_command(stream_name, payload, trim_options))
     end
   end
 
   def xadd_stream_pipelined(pipeline, stream_name, payload, event = nil)
-    # Build the xadd arguments properly for the Redis gem in pipelined mode
     trim_options = get_trim_options(event)
-    if trim_options.empty?
-      pipeline.xadd(stream_name, @field => payload)
+    if pipeline.respond_to?(:xadd)
+      if trim_options.empty?
+        pipeline.xadd(stream_name, @field => payload)
+      else
+        pipeline.xadd(stream_name, @field => payload, **trim_options)
+      end
     else
-      pipeline.xadd(stream_name, @field => payload, **trim_options)
+      # redis-rb 3.x's Pipeline#call takes the command as a single array.
+      pipeline.call(build_xadd_command(stream_name, payload, trim_options))
     end
   end
 
