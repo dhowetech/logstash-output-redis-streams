@@ -1,7 +1,9 @@
 ## Unreleased
   - Performance: run with `concurrency :shared` and pool Redis connections
     (`pool_size`/`pool_timeout`) so concurrent pipeline workers no longer
-    serialize on a single shared socket
+    serialize on a single shared socket. Pooling is implemented with a
+    small stdlib-only pool (no new runtime gem dependency), so it installs
+    cleanly in restricted/air-gapped Logstash environments.
   - Reliability: retries now use exponential backoff (`reconnect_interval`,
     capped by new `max_reconnect_interval`) instead of a fixed sleep, so a
     struggling Redis backs off without blocking the pipeline indefinitely

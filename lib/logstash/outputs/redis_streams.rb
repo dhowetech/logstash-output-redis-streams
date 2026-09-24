@@ -4,7 +4,8 @@ require "logstash/namespace"
 require "stud/buffer"
 require "redis"
 require "zlib"
-require "connection_pool"
+require "thread"
+require "timeout"
 
 # This output will send events to Redis Streams using XADD.
 # Redis Streams were introduced in Redis 5.0 and provide a powerful
@@ -198,7 +199,7 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     # Connection pool so multiple concurrent pipeline workers (this output
     # runs with `concurrency :shared`) each get their own Redis connection
     # instead of contending for a single shared socket.
-    @pool = ConnectionPool.new(size: @pool_size, timeout: @pool_timeout) { connect }
+    @pool = RedisConnectionPool.new(size: @pool_size, timeout: @pool_timeout) { connect }
 
     @codec.on_event(&method(:send_to_redis_stream))
   end # def register
@@ -276,6 +277,79 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   # relying on shared/racy instance state across concurrently-connecting
   # worker threads.
   RedisConnection = Struct.new(:redis, :host, :port)
+
+  # Minimal thread-safe connection pool built on Ruby stdlib only (Mutex +
+  # ConditionVariable). Connections are created lazily up to `size` and
+  # reused across calls to `with`; a caller blocks (up to `timeout`
+  # seconds) waiting for a connection if the pool is fully checked out.
+  #
+  # Deliberately avoids taking on an external gem dependency (e.g. the
+  # `connection_pool` gem): Logstash plugins are often installed in
+  # restricted/air-gapped environments where `logstash-plugin install`
+  # resolves against a private/offline gem mirror that may not carry
+  # arbitrary third-party gems, causing Bundler dependency resolution
+  # failures at install time.
+  class RedisConnectionPool
+    def initialize(size:, timeout:, &factory)
+      @size = size
+      @timeout = timeout
+      @factory = factory
+      @mutex = Mutex.new
+      @resource = ConditionVariable.new
+      @available = []
+      @created = 0
+    end
+
+    # Checks out a connection (creating one if under `size` and none are
+    # idle), yields it, and always returns it to the pool afterwards -
+    # even if the block raises.
+    def with
+      conn = checkout
+      begin
+        yield conn
+      ensure
+        checkin(conn)
+      end
+    end
+
+    # Hands each known connection to the given block (e.g. to close it)
+    # and resets the pool so it can be reused if needed.
+    def shutdown
+      @mutex.synchronize do
+        @available.each { |conn| yield conn if block_given? }
+        @available.clear
+        @created = 0
+      end
+    end
+
+    private
+
+    def checkout
+      deadline = Time.now + @timeout
+      @mutex.synchronize do
+        loop do
+          return @available.pop unless @available.empty?
+          if @created < @size
+            @created += 1
+            return @factory.call
+          end
+
+          remaining = deadline - Time.now
+          if remaining <= 0
+            raise Timeout::Error, "Timed out waiting for a Redis connection from the pool after #{@timeout}s"
+          end
+          @resource.wait(@mutex, remaining)
+        end
+      end
+    end
+
+    def checkin(conn)
+      @mutex.synchronize do
+        @available.push(conn)
+        @resource.signal
+      end
+    end
+  end
 
   # Delay (in seconds) before the next retry attempt, using exponential
   # backoff based on @reconnect_interval, capped at @max_reconnect_interval.
