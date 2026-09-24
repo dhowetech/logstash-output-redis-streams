@@ -120,6 +120,18 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   # Interval for reconnecting to failed Redis connections
   config :reconnect_interval, :validate => :number, :default => 1
 
+  # Maximum number of consecutive attempts to send an event (or a batch of
+  # events) to Redis before giving up on it. Once this limit is reached the
+  # event(s) are dropped (and logged at error level) instead of being retried
+  # further.
+  #
+  # This protects the Logstash pipeline from blocking indefinitely when Redis
+  # is unreachable or refuses writes (e.g. `OOM command not allowed` when
+  # `maxmemory` is reached). Set to 0 to retry forever (legacy behavior) -
+  # NOT recommended, since it will stall the whole pipeline while Redis stays
+  # unavailable.
+  config :max_retries, :validate => :number, :default => 3
+
   # Maximum length of each stream. When a stream reaches this length,
   # Redis will automatically trim it. Set to 0 to disable trimming.
   config :maxlen, :validate => :number, :default => 0
@@ -170,25 +182,54 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   end # def receive
 
   # called from Stud::Buffer#buffer_flush when there are events to flush
+  #
+  # NOTE: Stud::Buffer retries a raised error forever (with only a 1 second
+  # sleep between attempts), which would block the whole Logstash pipeline
+  # indefinitely if Redis stays unavailable/full. To avoid that, retries are
+  # handled here instead, bounded by @max_retries; once exceeded, the batch
+  # is dropped (logged at error level) and this method returns normally so
+  # Stud::Buffer does not retry it again.
   def flush(events, stream_name, close=false)
-    @redis ||= connect
-    
-    # Use Redis pipelining to send all XADD commands in a single network round-trip
-    @redis.pipelined do |pipeline|
-      events.each do |event_payload|
-        xadd_stream_pipelined(pipeline, stream_name, event_payload, nil)
+    attempt = 0
+
+    begin
+      @redis ||= connect
+
+      # Use Redis pipelining to send all XADD commands in a single network round-trip
+      @redis.pipelined do |pipeline|
+        events.each do |event_payload|
+          xadd_stream_pipelined(pipeline, stream_name, event_payload, nil)
+        end
       end
+    rescue => e
+      attempt += 1
+      @logger.warn("Failed to send batch of events to Redis Stream",
+        :identity => identity, :exception => e, :attempt => attempt,
+        :backtrace => e.backtrace
+      )
+      @redis = nil
+
+      if @max_retries > 0 && attempt >= @max_retries
+        @logger.error("Dropping batch of #{events.size} events after #{attempt} failed attempts to write to Redis Stream",
+          :identity => identity)
+        return
+      end
+
+      sleep @reconnect_interval
+      retry
     end
   end
 
   # called from Stud::Buffer#buffer_flush when an error occurs
+  # (kept as a safety net; #flush handles its own retries/drops so this
+  # should not normally be invoked)
   def on_flush_error(e)
     @logger.warn("Failed to send backlog of events to Redis",
       :identity => identity,
       :exception => e,
       :backtrace => e.backtrace
     )
-    @redis = connect
+    @redis = nil
   end
 
   def close
@@ -443,16 +484,26 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
       return
     end
 
+    attempt = 0
+
     begin
       @redis ||= connect
-      
+
       xadd_stream(stream_name, payload, event)
     rescue => e
+      attempt += 1
       @logger.warn("Failed to send event to Redis Stream", :event => event,
-                   :identity => identity, :exception => e,
+                   :identity => identity, :exception => e, :attempt => attempt,
                    :backtrace => e.backtrace)
-      sleep @reconnect_interval
       @redis = nil
+
+      if @max_retries > 0 && attempt >= @max_retries
+        @logger.error("Dropping event after #{attempt} failed attempts to write to Redis Stream",
+          :event => event, :identity => identity)
+        return
+      end
+
+      sleep @reconnect_interval
       retry
     end
   end

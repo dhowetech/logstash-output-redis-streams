@@ -197,6 +197,43 @@ describe LogStash::Outputs::RedisStreams do
     end
   end
 
+  context "when Redis writes keep failing" do
+    let(:config) {
+      {
+        "stream" => "test_stream",
+        "max_retries" => 3,
+        "reconnect_interval" => 0
+      }
+    }
+    let(:redis_streams) { described_class.new(config) }
+
+    it "drops the event (non-batch mode) after max_retries attempts instead of retrying forever" do
+      redis_streams.register
+      mock_redis = double("redis")
+      allow(redis_streams).to receive(:connect).and_return(mock_redis)
+      allow(mock_redis).to receive(:respond_to?).with(:xadd).and_return(true)
+      allow(mock_redis).to receive(:xadd).and_raise(Redis::CommandError, "OOM command not allowed")
+
+      event = LogStash::Event.new({"message" => "test message"})
+
+      expect(mock_redis).to receive(:xadd).exactly(3).times
+      expect(redis_streams.logger).to receive(:error).with(/Dropping event after 3 failed attempts/, anything)
+      expect { redis_streams.send(:send_to_redis_stream, event, "{}") }.to_not raise_error
+    end
+
+    it "drops the batch (batch mode) after max_retries attempts instead of retrying forever" do
+      config["batch"] = true
+      redis_streams.register
+      mock_redis = double("redis")
+      allow(redis_streams).to receive(:connect).and_return(mock_redis)
+      allow(mock_redis).to receive(:pipelined).and_raise(Redis::CommandError, "OOM command not allowed")
+
+      expect(mock_redis).to receive(:pipelined).exactly(3).times
+      expect(redis_streams.logger).to receive(:error).with(/Dropping batch of 2 events after 3 failed attempts/, anything)
+      expect { redis_streams.send(:flush, ["{}", "{}"], "test_stream") }.to_not raise_error
+    end
+  end
+
   context "with SSL enabled" do
     let(:config) {{ "ssl_enabled" => true, "stream" => "test_stream" }}
     subject(:plugin) { described_class.new(config) }
