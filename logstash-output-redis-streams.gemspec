@@ -25,6 +25,7 @@ Gem::Specification.new do |s|
 
   s.add_runtime_dependency 'redis', '>= 3.3', '< 6.0'
   s.add_runtime_dependency 'stud', '~> 0.0'
+  s.add_runtime_dependency 'connection_pool', '~> 2.2'
 
   s.add_development_dependency 'logstash-devutils', '~> 1.0'
   s.add_development_dependency 'logstash-input-generator', '~> 1.0'

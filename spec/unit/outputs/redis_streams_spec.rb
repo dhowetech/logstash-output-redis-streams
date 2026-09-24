@@ -179,7 +179,7 @@ describe LogStash::Outputs::RedisStreams do
     it "should use Redis pipelining when flushing batched events" do
       redis_streams.register
       mock_redis = double("redis")
-      allow(redis_streams).to receive(:connect).and_return(mock_redis)
+      allow(redis_streams).to receive(:connect).and_return(LogStash::Outputs::RedisStreams::RedisConnection.new(mock_redis, "127.0.0.1", 6379))
       allow(mock_redis).to receive(:respond_to?).with(:xadd).and_return(true)
 
       # Mock pipelining - the key test is that pipelined is called
@@ -210,7 +210,7 @@ describe LogStash::Outputs::RedisStreams do
     it "drops the event (non-batch mode) after max_retries attempts instead of retrying forever" do
       redis_streams.register
       mock_redis = double("redis")
-      allow(redis_streams).to receive(:connect).and_return(mock_redis)
+      allow(redis_streams).to receive(:connect).and_return(LogStash::Outputs::RedisStreams::RedisConnection.new(mock_redis, "127.0.0.1", 6379))
       allow(mock_redis).to receive(:respond_to?).with(:xadd).and_return(true)
       allow(mock_redis).to receive(:xadd).and_raise(Redis::CommandError, "OOM command not allowed")
 
@@ -225,7 +225,7 @@ describe LogStash::Outputs::RedisStreams do
       config["batch"] = true
       redis_streams.register
       mock_redis = double("redis")
-      allow(redis_streams).to receive(:connect).and_return(mock_redis)
+      allow(redis_streams).to receive(:connect).and_return(LogStash::Outputs::RedisStreams::RedisConnection.new(mock_redis, "127.0.0.1", 6379))
       allow(mock_redis).to receive(:pipelined).and_raise(Redis::CommandError, "OOM command not allowed")
 
       expect(mock_redis).to receive(:pipelined).exactly(3).times
@@ -292,7 +292,7 @@ describe LogStash::Outputs::RedisStreams do
     let(:mock_redis) { double("redis") }
 
     before do
-      allow(redis_streams).to receive(:connect).and_return(mock_redis)
+      allow(redis_streams).to receive(:connect).and_return(LogStash::Outputs::RedisStreams::RedisConnection.new(mock_redis, "127.0.0.1", 6379))
     end
 
     context "with a redis-rb 4.x/5.x client (native xadd)" do
@@ -309,13 +309,13 @@ describe LogStash::Outputs::RedisStreams do
           {"body" => payload}
         )
 
-        redis_streams.send(:xadd_stream, "test_stream", payload)
+        redis_streams.send(:xadd_stream, mock_redis, "test_stream", payload)
       end
 
       it "should add MAXLEN trimming when configured" do
         config_with_maxlen = config.merge("maxlen" => 1000, "approximate_trimming" => true)
         redis_streams_with_maxlen = described_class.new(config_with_maxlen)
-        allow(redis_streams_with_maxlen).to receive(:connect).and_return(mock_redis)
+        allow(redis_streams_with_maxlen).to receive(:connect).and_return(LogStash::Outputs::RedisStreams::RedisConnection.new(mock_redis, "127.0.0.1", 6379))
         redis_streams_with_maxlen.register
 
         payload = '{"message":"test"}'
@@ -327,7 +327,7 @@ describe LogStash::Outputs::RedisStreams do
           :approximate => true
         )
 
-        redis_streams_with_maxlen.send(:xadd_stream, "test_stream", payload)
+        redis_streams_with_maxlen.send(:xadd_stream, mock_redis, "test_stream", payload)
       end
     end
 
@@ -344,13 +344,13 @@ describe LogStash::Outputs::RedisStreams do
           :xadd, "test_stream", "*", "body", payload
         )
 
-        redis_streams.send(:xadd_stream, "test_stream", payload)
+        redis_streams.send(:xadd_stream, mock_redis, "test_stream", payload)
       end
 
       it "should include MAXLEN trimming in the raw command when configured" do
         config_with_maxlen = config.merge("maxlen" => 1000, "approximate_trimming" => true)
         redis_streams_with_maxlen = described_class.new(config_with_maxlen)
-        allow(redis_streams_with_maxlen).to receive(:connect).and_return(mock_redis)
+        allow(redis_streams_with_maxlen).to receive(:connect).and_return(LogStash::Outputs::RedisStreams::RedisConnection.new(mock_redis, "127.0.0.1", 6379))
         redis_streams_with_maxlen.register
 
         payload = '{"message":"test"}'
@@ -359,7 +359,7 @@ describe LogStash::Outputs::RedisStreams do
           :xadd, "test_stream", "MAXLEN", "~", 1000, "*", "body", payload
         )
 
-        redis_streams_with_maxlen.send(:xadd_stream, "test_stream", payload)
+        redis_streams_with_maxlen.send(:xadd_stream, mock_redis, "test_stream", payload)
       end
     end
   end

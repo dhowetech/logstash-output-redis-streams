@@ -47,7 +47,11 @@ output {
 ### Redis-to-OTel Bridge Configuration
 
 The bridge expects the complete JSON event in one stream field named `body`. Use
-one output per bridge stream:
+one output per bridge stream. The example below includes the recommended
+production settings (batching/pipelining, connection pooling, bounded
+timeouts/retries, and stream trimming — see
+[Recommended Production Configuration](#recommended-production-configuration)
+for details):
 
 ```ruby
 output {
@@ -59,6 +63,32 @@ output {
       stream => "log4_logs"
       field => "body"
       codec => json
+
+      # Batch + pipeline events to cut network round-trips
+      batch => true
+      batch_events => 200
+      batch_timeout => 2
+
+      # Pool connections so concurrent pipeline workers don't serialize on
+      # one shared socket. Size the pool to match (or exceed) pipeline.workers.
+      pool_size => 8
+      pool_timeout => 5
+
+      # Fail fast on a truly stuck Redis instead of blocking the pipeline
+      connect_timeout => 2
+      read_timeout => 2
+      write_timeout => 2
+
+      # Retry with exponential backoff, bounded so a single batch can't
+      # stall a worker thread indefinitely; drop after repeated failures
+      # rather than backing up the whole pipeline.
+      reconnect_interval => 1
+      max_reconnect_interval => 10
+      max_retries => 5
+
+      # Bound stream growth so Redis memory doesn't grow unbounded
+      max_stream_size => 1000000
+      approximate_trimming => true
     }
   }
 
@@ -70,6 +100,24 @@ output {
       stream => "log4_metrics"
       field => "body"
       codec => json
+
+      batch => true
+      batch_events => 200
+      batch_timeout => 2
+
+      pool_size => 8
+      pool_timeout => 5
+
+      connect_timeout => 2
+      read_timeout => 2
+      write_timeout => 2
+
+      reconnect_interval => 1
+      max_reconnect_interval => 10
+      max_retries => 5
+
+      max_stream_size => 1000000
+      approximate_trimming => true
     }
   }
 }
@@ -134,6 +182,60 @@ output {
 }
 ```
 
+### Recommended Production Configuration
+
+Under sustained/high-volume load, the defaults favor safety over throughput
+(single connection, no batching, fixed 1s retry sleep). For production
+deployments, combine batching/pipelining with connection pooling and
+exponential backoff so this output can scale with `pipeline.workers` and
+degrade gracefully if Redis is slow or briefly unavailable:
+
+```ruby
+output {
+  redis_streams {
+    host              => ["redis-1:6379", "redis-2:6379"]  # multiple hosts for failover
+    stream            => "logstash-events"
+
+    # Batch + pipeline events to cut network round-trips
+    batch             => true
+    batch_events      => 200
+    batch_timeout     => 2
+
+    # Pool connections so concurrent pipeline workers don't serialize on
+    # one shared socket. Size the pool to match (or exceed) pipeline.workers.
+    pool_size         => 8
+    pool_timeout      => 5
+
+    # Fail fast on a truly stuck Redis instead of blocking the pipeline
+    connect_timeout   => 2
+    read_timeout      => 2
+    write_timeout     => 2
+
+    # Retry with exponential backoff, bounded so a single batch can't
+    # stall a worker thread indefinitely; drop after repeated failures
+    # rather than backing up the whole pipeline.
+    reconnect_interval     => 1
+    max_reconnect_interval => 10
+    max_retries            => 5
+
+    # Bound stream growth so Redis memory doesn't grow unbounded
+    max_stream_size   => 1000000
+    approximate_trimming => true
+  }
+}
+```
+
+Tuning notes:
+- Set `pool_size` to at least `pipeline.workers` (or your expected
+  concurrent output invocations) so workers aren't waiting on the pool.
+- Keep `batch_events` and `batch_timeout` balanced against acceptable
+  end-to-end latency — larger batches reduce round-trips but delay delivery.
+- `max_retries` combined with `max_reconnect_interval` bounds the worst-case
+  time a single failed batch/event can hold up the pipeline:
+  roughly `connect/read/write_timeout + sum of backoff delays`. Tune lower
+  for latency-sensitive pipelines, higher for durability during brief Redis
+  blips.
+
 ### Stream Length Management
 ```ruby
 output {
@@ -182,6 +284,11 @@ output {
 | `stream_retention` | number | No | `0` | Time-based retention in seconds - removes messages older than this (0 = unlimited) |
 | `approximate_trimming` | boolean | No | `true` | Use approximate trimming for better performance |
 | `ssl_enabled` | boolean | No | `false` | Enable SSL/TLS |
+| `pool_size` | number | No | `5` | Number of pooled Redis connections; each concurrent pipeline worker checks out its own connection instead of contending for one shared socket |
+| `pool_timeout` | number | No | `5` | Seconds a worker waits for a pooled connection before raising an error |
+| `reconnect_interval` | number | No | `1` | Base delay (seconds) before retrying a failed send; retries use exponential backoff |
+| `max_reconnect_interval` | number | No | `10` | Upper bound (seconds) on the exponential backoff delay between retries |
+| `max_retries` | number | No | `3` | Maximum consecutive send attempts before dropping the event/batch (0 = retry forever) |
 
 ## Requirements
 

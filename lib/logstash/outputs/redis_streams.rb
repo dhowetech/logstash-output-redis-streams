@@ -4,6 +4,7 @@ require "logstash/namespace"
 require "stud/buffer"
 require "redis"
 require "zlib"
+require "connection_pool"
 
 # This output will send events to Redis Streams using XADD.
 # Redis Streams were introduced in Redis 5.0 and provide a powerful
@@ -16,6 +17,12 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   include Stud::Buffer
 
   config_name "redis_streams"
+
+  # Allow Logstash to run multiple pipeline workers concurrently against this
+  # output. Safe because Redis client access is guarded by a connection pool
+  # below (each worker checks out its own connection instead of contending
+  # for a single shared socket).
+  concurrency :shared
 
   default :codec, "json"
 
@@ -77,6 +84,17 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   # Redis write timeout in seconds.
   config :write_timeout, :validate => :number, :default => 5
 
+  # Number of Redis connections to keep in the pool. Since this output runs
+  # with `concurrency :shared`, multiple Logstash pipeline workers may call
+  # into it at the same time; each concurrent call checks out its own
+  # connection from this pool instead of contending for a single shared
+  # socket. Should generally be >= `pipeline.workers`.
+  config :pool_size, :validate => :number, :default => 5
+
+  # How long (in seconds) a worker thread will wait for a connection to
+  # become available from the pool before raising an error.
+  config :pool_timeout, :validate => :number, :default => 5
+
   # Password to authenticate with.  There is no authentication by default.
   config :password, :validate => :password
 
@@ -117,8 +135,16 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   # when there are pending events to flush.
   config :batch_timeout, :validate => :number, :default => 5
 
-  # Interval for reconnecting to failed Redis connections
+  # Base interval (in seconds) to wait before retrying after a failed send.
+  # Retries use exponential backoff (reconnect_interval * 2^(attempt-1)),
+  # capped by `max_reconnect_interval`, so a struggling Redis backs off
+  # instead of hammering it while still failing fast overall.
   config :reconnect_interval, :validate => :number, :default => 1
+
+  # Upper bound (in seconds) on the exponential backoff delay between retry
+  # attempts, so a large `max_retries` can't stall the calling worker thread
+  # for an unbounded amount of time on a single event/batch.
+  config :max_reconnect_interval, :validate => :number, :default => 10
 
   # Maximum number of consecutive attempts to send an event (or a batch of
   # events) to Redis before giving up on it. Once this limit is reached the
@@ -163,11 +189,16 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
       )
     end
 
-    @redis = nil
     if @shuffle_hosts
         @host.shuffle!
     end
     @host_idx = 0
+    @host_idx_mutex = Mutex.new
+
+    # Connection pool so multiple concurrent pipeline workers (this output
+    # runs with `concurrency :shared`) each get their own Redis connection
+    # instead of contending for a single shared socket.
+    @pool = ConnectionPool.new(size: @pool_size, timeout: @pool_timeout) { connect }
 
     @codec.on_event(&method(:send_to_redis_stream))
   end # def register
@@ -191,31 +222,32 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   # Stud::Buffer does not retry it again.
   def flush(events, stream_name, close=false)
     attempt = 0
+    last_host, last_port = nil, nil
 
     begin
-      @redis ||= connect
-
-      # Use Redis pipelining to send all XADD commands in a single network round-trip
-      @redis.pipelined do |pipeline|
-        events.each do |event_payload|
-          xadd_stream_pipelined(pipeline, stream_name, event_payload, nil)
+      @pool.with do |conn|
+        last_host, last_port = conn.host, conn.port
+        # Use Redis pipelining to send all XADD commands in a single network round-trip
+        conn.redis.pipelined do |pipeline|
+          events.each do |event_payload|
+            xadd_stream_pipelined(pipeline, stream_name, event_payload, nil)
+          end
         end
       end
     rescue => e
       attempt += 1
       @logger.warn("Failed to send batch of events to Redis Stream",
-        :identity => identity, :exception => e, :attempt => attempt,
+        :identity => identity(last_host, last_port), :exception => e, :attempt => attempt,
         :backtrace => e.backtrace
       )
-      @redis = nil
 
       if @max_retries > 0 && attempt >= @max_retries
         @logger.error("Dropping batch of #{events.size} events after #{attempt} failed attempts to write to Redis Stream",
-          :identity => identity)
+          :identity => identity(last_host, last_port))
         return
       end
 
-      sleep @reconnect_interval
+      sleep backoff_interval(attempt)
       retry
     end
   end
@@ -225,36 +257,38 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   # should not normally be invoked)
   def on_flush_error(e)
     @logger.warn("Failed to send backlog of events to Redis",
-      :identity => identity,
       :exception => e,
       :backtrace => e.backtrace
     )
-    @redis = nil
   end
 
   def close
     if @batch
       buffer_flush(:final => true)
     end
-    if @redis
-      @redis.quit
-      @redis = nil
-    end
+    @pool.shutdown { |conn| conn.redis.quit } if @pool
   end
 
   private
 
-  def connect
-    @current_host, @current_port = @host[@host_idx].split(':')
-    @host_idx = @host_idx + 1 >= @host.length ? 0 : @host_idx + 1
+  # Redis connection paired with the host/port it was created against, so
+  # log messages can identify which backend a failure came from without
+  # relying on shared/racy instance state across concurrently-connecting
+  # worker threads.
+  RedisConnection = Struct.new(:redis, :host, :port)
 
-    if not @current_port
-      @current_port = @port
-    end
+  # Delay (in seconds) before the next retry attempt, using exponential
+  # backoff based on @reconnect_interval, capped at @max_reconnect_interval.
+  def backoff_interval(attempt)
+    [@reconnect_interval * (2**(attempt - 1)), @max_reconnect_interval].min
+  end
+
+  def connect
+    current_host, current_port = next_host_and_port
 
     params = {
-      :host => @current_host,
-      :port => @current_port,
+      :host => current_host,
+      :port => current_port,
       :connect_timeout => @connect_timeout,
       :read_timeout => @read_timeout,
       :write_timeout => @write_timeout,
@@ -270,8 +304,22 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
       params[:password] = @password.value
     end
 
-    Redis.new(params)
+    RedisConnection.new(Redis.new(params), current_host, current_port)
   end # def connect
+
+  # Thread-safe round-robin host selection, since multiple pooled
+  # connections may be established concurrently by different workers.
+  def next_host_and_port
+    host_str = nil
+    @host_idx_mutex.synchronize do
+      host_str = @host[@host_idx]
+      @host_idx = @host_idx + 1 >= @host.length ? 0 : @host_idx + 1
+    end
+
+    current_host, current_port = host_str.split(':')
+    current_port ||= @port
+    [current_host, current_port]
+  end
 
   def setup_ssl_params
     require "openssl"
@@ -441,17 +489,17 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     args
   end
 
-  def xadd_stream(stream_name, payload, event = nil)
+  def xadd_stream(redis, stream_name, payload, event = nil)
     trim_options = get_trim_options(event)
-    if @redis.respond_to?(:xadd)
+    if redis.respond_to?(:xadd)
       if trim_options.empty?
-        @redis.xadd(stream_name, @field => payload)
+        redis.xadd(stream_name, @field => payload)
       else
-        @redis.xadd(stream_name, @field => payload, **trim_options)
+        redis.xadd(stream_name, @field => payload, **trim_options)
       end
     else
       # redis-rb 3.x has no native `xadd`; issue the raw command instead.
-      @redis.call(*build_xadd_command(stream_name, payload, trim_options))
+      redis.call(*build_xadd_command(stream_name, payload, trim_options))
     end
   end
 
@@ -470,9 +518,9 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
   end
 
   # A string used to identify a Redis instance in log messages
-  def identity
+  def identity(host = nil, port = nil)
     password_part = @password ? "****@" : ""
-    "redis://#{password_part}#{@current_host}:#{@current_port}/#{@db} stream:#{@stream}"
+    "redis://#{password_part}#{host}:#{port}/#{@db} stream:#{@stream}"
   end
 
   def send_to_redis_stream(event, payload)
@@ -485,25 +533,26 @@ class LogStash::Outputs::RedisStreams < LogStash::Outputs::Base
     end
 
     attempt = 0
+    last_host, last_port = nil, nil
 
     begin
-      @redis ||= connect
-
-      xadd_stream(stream_name, payload, event)
+      @pool.with do |conn|
+        last_host, last_port = conn.host, conn.port
+        xadd_stream(conn.redis, stream_name, payload, event)
+      end
     rescue => e
       attempt += 1
       @logger.warn("Failed to send event to Redis Stream", :event => event,
-                   :identity => identity, :exception => e, :attempt => attempt,
+                   :identity => identity(last_host, last_port), :exception => e, :attempt => attempt,
                    :backtrace => e.backtrace)
-      @redis = nil
 
       if @max_retries > 0 && attempt >= @max_retries
         @logger.error("Dropping event after #{attempt} failed attempts to write to Redis Stream",
-          :event => event, :identity => identity)
+          :event => event, :identity => identity(last_host, last_port))
         return
       end
 
-      sleep @reconnect_interval
+      sleep backoff_interval(attempt)
       retry
     end
   end

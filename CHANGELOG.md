@@ -1,3 +1,11 @@
+## Unreleased
+  - Performance: run with `concurrency :shared` and pool Redis connections
+    (`pool_size`/`pool_timeout`) so concurrent pipeline workers no longer
+    serialize on a single shared socket
+  - Reliability: retries now use exponential backoff (`reconnect_interval`,
+    capped by new `max_reconnect_interval`) instead of a fixed sleep, so a
+    struggling Redis backs off without blocking the pipeline indefinitely
+
 ## 1.0.0
   - Initial release of logstash-output-redis-streams plugin
   - Support for Redis Streams using XADD command
